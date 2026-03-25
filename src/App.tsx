@@ -1,4 +1,5 @@
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import * as Tone from 'tone'
 import { useHandTracking } from './hooks/useHandTracking'
 import { usePianoInteraction } from './hooks/usePianoInteraction'
 import type { PianoKeyArea } from './types/handTracking'
@@ -29,6 +30,46 @@ const createPianoKeys = (
 
 function App() {
   const [lastPressed, setLastPressed] = useState<string>('None')
+  const [audioState, setAudioState] = useState<string>('unknown')
+  const [audioError, setAudioError] = useState<string | null>(null)
+  const synthRef = useRef<Tone.PolySynth | null>(null)
+
+  useEffect(() => {
+    const synth = new Tone.PolySynth(Tone.Synth, {
+      oscillator: { type: 'triangle' },
+      envelope: {
+        attack: 0.01,
+        decay: 0.1,
+        sustain: 0.2,
+        release: 0.4,
+      },
+    }).toDestination()
+
+    synth.volume.value = 0
+    synthRef.current = synth
+    setAudioState(Tone.getContext().state)
+
+    return () => {
+      synth.dispose()
+      synthRef.current = null
+    }
+  }, [])
+
+  const ensureAudioReady = useCallback(async () => {
+    try {
+      if (Tone.getContext().state !== 'running') {
+        await Tone.start()
+      }
+      setAudioState(Tone.getContext().state)
+      setAudioError(null)
+      return true
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Audio init failed.'
+      setAudioError(message)
+      setAudioState(Tone.getContext().state)
+      return false
+    }
+  }, [])
 
   const pianoKeys = useMemo(
     () =>
@@ -47,13 +88,52 @@ function App() {
 
   const { activeKeyIds, hoverKeyIds, processFrame } = usePianoInteraction({
     keys: pianoKeys,
-    pressDepthThreshold: -0.05,
+    pressDepthThreshold: 0.02,
     retriggerDelayMs: 100,
     velocitySensitivity: 1,
     onPress: (event) => {
       setLastPressed(`${event.note} (velocity: ${event.velocity.toFixed(2)})`)
+      const synth = synthRef.current
+      if (!synth) {
+        return
+      }
+
+      const safeVelocity = Math.max(0.6, event.velocity)
+
+      if (Tone.getContext().state !== 'running') {
+        void ensureAudioReady().then((ready) => {
+          if (ready) {
+            synth.triggerAttackRelease(event.note, '8n', undefined, safeVelocity)
+          }
+        })
+        return
+      }
+
+      synth.triggerAttackRelease(event.note, '8n', undefined, safeVelocity)
     },
   })
+
+  const noteById = useMemo(() => {
+    const map = new Map<string, string>()
+    for (const key of pianoKeys) {
+      map.set(key.id, key.note)
+    }
+    return map
+  }, [pianoKeys])
+
+  const hoveredNotes = useMemo(() => {
+    const notes = hoverKeyIds
+      .map((id) => noteById.get(id))
+      .filter((value): value is string => Boolean(value))
+    return notes.length > 0 ? notes.join(', ') : 'None'
+  }, [hoverKeyIds, noteById])
+
+  const activeNotes = useMemo(() => {
+    const notes = activeKeyIds
+      .map((id) => noteById.get(id))
+      .filter((value): value is string => Boolean(value))
+    return notes.length > 0 ? notes.join(', ') : 'None'
+  }, [activeKeyIds, noteById])
 
   const { videoRef, state, start, stop } = useHandTracking({
     mirrorX: true,
@@ -95,10 +175,32 @@ function App() {
         <div className="mt-4 flex flex-wrap gap-2.5">
           <button
             type="button"
-            onClick={() => void start()}
+            onClick={() => void (async () => {
+              await ensureAudioReady()
+              await start()
+            })()}
             className="rounded-lg border border-cyan-300/70 bg-slate-900/90 px-4 py-2 text-sm font-semibold text-cyan-100 transition hover:-translate-y-0.5 hover:shadow-[0_0_0_1px_rgba(34,211,238,0.5),0_10px_24px_rgba(0,0,0,0.28)]"
           >
             Start Tracking
+          </button>
+          <button
+            type="button"
+            onClick={() => void ensureAudioReady()}
+            className="rounded-lg border border-emerald-300/70 bg-slate-900/90 px-4 py-2 text-sm font-semibold text-emerald-100 transition hover:-translate-y-0.5 hover:shadow-[0_0_0_1px_rgba(16,185,129,0.5),0_10px_24px_rgba(0,0,0,0.28)]"
+          >
+            Enable Audio
+          </button>
+          <button
+            type="button"
+            onClick={() => void (async () => {
+              const ready = await ensureAudioReady()
+              if (ready) {
+                synthRef.current?.triggerAttackRelease('C4', '8n', undefined, 0.6)
+              }
+            })()}
+            className="rounded-lg border border-amber-300/70 bg-slate-900/90 px-4 py-2 text-sm font-semibold text-amber-100 transition hover:-translate-y-0.5 hover:shadow-[0_0_0_1px_rgba(251,191,36,0.5),0_10px_24px_rgba(0,0,0,0.28)]"
+          >
+            Test Sound
           </button>
           <button
             type="button"
@@ -128,14 +230,35 @@ function App() {
             </strong>
           </div>
           <div className="grid gap-1 rounded-xl border border-white/10 bg-white/5 p-2.5">
+            <span className="text-xs text-slate-300">Audio</span>
+            <strong className="text-sm font-semibold text-slate-100">
+              {audioState}
+            </strong>
+          </div>
+          <div className="grid gap-1 rounded-xl border border-white/10 bg-white/5 p-2.5">
             <span className="text-xs text-slate-300">Last Pressed</span>
             <strong className="text-sm font-semibold text-slate-100">
               {lastPressed}
             </strong>
           </div>
+          <div className="grid gap-1 rounded-xl border border-white/10 bg-white/5 p-2.5">
+            <span className="text-xs text-slate-300">Hovered Keys</span>
+            <strong className="text-sm font-semibold text-slate-100">
+              {hoveredNotes}
+            </strong>
+          </div>
+          <div className="grid gap-1 rounded-xl border border-white/10 bg-white/5 p-2.5">
+            <span className="text-xs text-slate-300">Active Keys</span>
+            <strong className="text-sm font-semibold text-slate-100">
+              {activeNotes}
+            </strong>
+          </div>
         </div>
         {state.errorMessage && (
           <p className="mt-3 text-sm text-rose-200">Error: {state.errorMessage}</p>
+        )}
+        {audioError && (
+          <p className="mt-2 text-sm text-rose-200">Audio Error: {audioError}</p>
         )}
       </header>
 
